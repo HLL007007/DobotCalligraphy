@@ -277,7 +277,6 @@ class BrushEngine:
 
                 # === [竖 SHU]：中锋铺毫 ===
                 elif s_type == "SHU":
-                    
                     if t > 0.5:
                         shu_extend = 100.0 * (t - 0.5) / 0.5 / self.cfg.FONT_SCALE
                         curr_p += unit_vec * shu_extend

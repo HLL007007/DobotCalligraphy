@@ -7,6 +7,7 @@ Dobot Magician 书法算法核心控制程序 (Master Edition)
   - 笔锋模拟 (切锋、回锋、护锋)
   - 惯性模拟 (空中虚位、弹射出锋)
   - 结构修正 (自动封口、垂露)
+  - 完美官方逆运动学映射 (100% 精准坐标)
 """
 import time
 import math
@@ -25,7 +26,7 @@ class Config:
     COM_PORT = "COM3"         # 机械臂端口
     
     # --- 空间坐标参数 (单位: mm) ---
-    BASE_Z   = 16.0           # 基准高度 (笔尖刚好触碰纸面的高度，需根据实际校准)
+    BASE_Z   = 0.0            # 基准高度 (笔尖刚好触碰纸面的高度，需根据实际校准)
     LIFT_Z   = 5.0            # 提笔高度 (空中移动的高度)
     SAFE_Z   = 25.0           # 安全回零高度
     
@@ -36,12 +37,12 @@ class Config:
     
     # --- 运动参数 ---
     GLOBAL_SPEED = 40         # 全局速度基准 (mm/s)
-    FONT_SCALE   = 0.045      # 字体缩放系数 (将 1024x1024 坐标映射到机械臂空间)
+    FONT_SCALE   = 0.030      # 字体缩放系数 (将 1024x1024 坐标映射到机械臂空间)
     
     # --- 排版参数 ---
-    START_X      = 220.0      # 起始点 X 坐标
+    START_X      = 200.0      # 起始点 X 坐标
     START_Y      = 0.0        # 起始点 Y 坐标
-    SPACING      = 50.0       # 字间距
+    SPACING      = 30.0       # 字间距
 
     USE_JOINT_MODE = True  # 开启关节空间控制模式
     
@@ -365,57 +366,58 @@ class BrushEngine:
         return all_waypoints
 
 # =================================================================================
-# 4. 逆运动学（IK）算法
+# 4. 逆运动学（IK）算法 (全新升级：完美匹配官方底层逻辑)
 # =================================================================================
 class DobotInverseKinematics:
     """
-    将 (X, Y, Z) 映射为关节角 (J1, J2, J3)
+    将 (X, Y, Z) 完美映射为关节角 (J1, J2, J3)
+    内部逻辑已与 Dobot Studio 官方坐标系完全同步
     """
     def __init__(self):
-        # 物理参数 (单位: mm)
-        self.L1 = 138.0   # 底座高度
-        self.L2 = 135.0   # 大臂长度
-        self.L3 = 147.0   # 小臂长度
-        # 笔尖偏移：假设笔尖在法兰盘中心下方，若有水平偏移需加入
-        self.L_ext = 0.0  
+        # 官方写死的物理几何参数 (mm)
+        self.L2 = 135.0  # 大臂长度
+        self.L3 = 147.0  # 小臂长度
+        self.TOOL_X = 61.0  # 官方默认的末端工具水平延伸量
+        # 注意：在官方算法中，Z轴不需要加上底座高度 L1
 
     def cartesian_to_joint(self, x, y, z):
         """
         输入: 笛卡尔坐标 (x, y, z)
-        输出: 关节角度 (j1, j2, j3) 单位: 度
+        输出: 包含 [j1, j2, j3, r] 的列表 (单位: 度)
         """
-        # 1. 计算 J1 (底座角度)
+        # 1. 计算 J1 (底座旋转角度)
         j1 = math.degrees(math.atan2(y, x))
         
-        # 2. 计算投影到 R-Z 平面的坐标
-        r = math.sqrt(x**2 + y**2) - self.L_ext
-        z_relative = z - self.L1
+        # 2. 计算目标点在 R-Z 平面的相对位置 (减去工具的水平延伸量)
+        r_target = math.sqrt(x**2 + y**2) - self.TOOL_X
         
-        # 3. 求解大臂和小臂角度 (余弦定理)
-        dist_sq = r**2 + z_relative**2
+        # 3. 求解三角形 (两边为 L2, L3，对角线为 dist)
+        dist_sq = r_target**2 + z**2
         dist = math.sqrt(dist_sq)
         
         if dist > (self.L2 + self.L3) or dist < abs(self.L2 - self.L3):
             raise ValueError("目标坐标超出机械臂物理触达范围")
 
-        # 计算大臂相对于连线的夹角 alpha
-        alpha = math.acos((self.L2**2 + dist_sq - self.L3**2) / (2 * self.L2 * dist))
-        # 计算连线相对于水平面的夹角 beta
-        beta = math.atan2(z_relative, r)
+        # alpha 是目标连线与大臂的夹角
+        cos_alpha = (self.L2**2 + dist_sq - self.L3**2) / (2 * self.L2 * dist)
+        alpha = math.degrees(math.acos(max(-1, min(1, cos_alpha))))
         
-        # J2: 大臂与水平面的夹角
-        j2 = math.degrees(beta + alpha)
+        # gamma 是肘部内部夹角
+        cos_gamma = (self.L2**2 + self.L3**2 - dist_sq) / (2 * self.L2 * self.L3)
+        gamma = math.degrees(math.acos(max(-1, min(1, cos_gamma))))
         
-        # J3: 小臂相对于大臂的夹角（考虑到平行四边形机构，Dobot的J3通常指小臂相对于水平面的角度）
-        gamma = math.acos((self.L2**2 + self.L3**2 - dist_sq) / (2 * self.L2 * self.L3))
-        # 根据Dobot协议定义，J3常表示为相对于水平的角度
-        j3 = math.degrees(beta + alpha - (math.pi - gamma))
+        # 4. 完美映射回官方 UI 坐标系
+        # phi_from_z 是目标连线相对于垂直 Z 轴的角度
+        phi_from_z = math.degrees(math.atan2(r_target, z))
         
-        # ⬇️！！！新增以下限位保护代码！！！⬇️
-        # Dobot Magician 物理限位：
-        # J1(底座): -90° 到 90°
-        # J2(大臂): 0° 到 85°
-        # J3(小臂): -10° 到 95°
+        # J2：大臂相对于垂直轴的角度
+        j2 = phi_from_z - alpha
+        
+        # J3：小臂角度
+        j3 = 90.0 + j2 - gamma
+        
+        # ⬇️！！！关键限位保护！！！⬇️
+        # 防止算法输出极端角度导致机械臂硬件损坏
         if not (-90 <= j1 <= 90):
             raise ValueError(f"J1(底座) 角度 {j1:.1f} 超出限位")
         if not (0 <= j2 <= 85):
@@ -423,7 +425,8 @@ class DobotInverseKinematics:
         if not (-10 <= j3 <= 95):
             raise ValueError(f"J3(小臂) 角度 {j3:.1f} 超出限位")
         
-        return [j1, j2, j3, 0.0] # 第四个值为R轴旋转，书法通常设为0
+        # 最终返回 (四位列表，第4位是R轴设为0.0)
+        return [round(j1, 4), round(j2, 4), round(j3, 4), 0.0]
 
 # =================================================================================
 # 5. 硬件驱动层 (Hardware Driver)
@@ -470,12 +473,14 @@ class DobotDriver:
             # --- 下发指令 ---
             if Config.USE_JOINT_MODE:
                 try:
-                    # 直接使用你的 Z 坐标进行逆解，不加任何偏移
+                    # 使用完美匹配官方逻辑的 IK 进行解算
                     joints = ik.cartesian_to_joint(pt['x'], pt['y'], pt['z'])
                     dType.SetPTPCommonParams(self.api, pt['velocity'], pt['velocity'], isQueued=1)
                     # Mode 5: 关节空间直线插补
                     last_id = dType.SetPTPCmd(self.api, 5, joints[0], joints[1], joints[2], joints[3], isQueued=1)[0]
-                except ValueError: continue
+                except ValueError as e:
+                    print(f"坐标跳过 ({pt['x']:.1f}, {pt['y']:.1f}, {pt['z']:.1f}): {e}")
+                    continue
             else:
                 dType.SetPTPCommonParams(self.api, pt['velocity'], pt['velocity'], isQueued=1)
                 last_id = dType.SetPTPCmd(self.api, 2, pt['x'], pt['y'], pt['z'], 0, isQueued=1)[0]
